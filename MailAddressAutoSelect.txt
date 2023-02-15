@@ -1,0 +1,42 @@
+Sub SearchAddressBook()
+    Dim olApp As Outlook.Application
+    Dim olMail As Outlook.MailItem
+    Dim xlApp As Excel.Application
+    Dim xlWbk As Excel.Workbook
+    Dim xlWsh As Excel.Worksheet
+    Dim xlRng As Excel.Range
+    Dim Recipient As Object
+    Dim recipientname As String
+    Dim department As String
+    Dim i As Integer
+    Dim Dept As String
+
+    Set olApp = Outlook.Application
+    Set olMail = olApp.CreateItem(olMailItem)
+    Set xlApp = New Excel.Application
+    Set xlWbk = xlApp.Workbooks.Open("対象者の氏名と部署が書かれたExcelファイルのパスを入れてください")
+    Set xlWsh = xlWbk.Worksheets("Sheet1")
+    Set xlRng = xlWsh.Range("A2:B3")
+
+    For i = 1 To xlRng.Rows.Count
+        recipientname = xlRng.Cells(i, 1).Value
+        department = xlRng.Cells(i, 2).Value
+        Set Recipient = olApp.Session.CreateRecipient(recipientname)
+        Recipient.Resolve
+        Dept = Recipient.AddressEntry.GetExchangeUser.department
+        Dept = Mid(Dept, InStrRev(Dept, "/", InStr(Dept, " ")) + 1, InStr(Dept, " ") - InStrRev(Dept, "/", InStr(Dept, " ")) - 1)
+        If Recipient.Resolved And StrConv(Dept, vbNarrow) = StrConv(department, vbNarrow) Then
+            olMail.Recipients.Add (Recipient)
+        End If
+    Next
+
+    olMail.Display
+    xlWbk.Close False
+    xlApp.Quit
+    Set xlWsh = Nothing
+    Set xlWbk = Nothing
+    Set xlApp = Nothing
+    Set olMail = Nothing
+    Set olApp = Nothing
+    Set Recipient = Nothing
+End Sub
