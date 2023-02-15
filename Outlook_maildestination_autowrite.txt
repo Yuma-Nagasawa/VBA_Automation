@@ -1,0 +1,160 @@
+Option Explicit
+Public flg As Integer
+Public cnt As Long
+Public sen As String
+Public tostrings As String
+Public ccstrings As String
+Public Dept As Variant
+Public Name As String
+Public ToDict As Scripting.Dictionary
+Public CcDict As Scripting.Dictionary
+Public sentenceTo As Scripting.Dictionary
+Public sentenceCc As Scripting.Dictionary
+Public clsmdl As Class1
+Sub Email_address_Autowrite()
+
+Dim Item As Object
+Dim objRecp As Recipient
+Dim objExchUser As ExchangeUser
+Dim objDoc As Object
+Dim eim As String
+
+'Public変数の初期化クラスモジュールの呼び出し
+Set clsmdl = New Class1
+Call clsmdl.PublicValueInitialize
+
+'エラー発生時､最下段のErhdlラベル処理を実施
+On Error GoTo Err
+
+'現在開いているメールの宛先から氏名を取得し、部署をキーにして辞書に格納
+Set Item = Application.ActiveInspector.CurrentItem
+
+'宛先の部署と名前を加工してDeptとNameに格納
+For Each objRecp In Item.Recipients
+    Set objExchUser = objRecp.AddressEntry.GetExchangeUser()
+
+    If Not objExchUser Is Nothing Then
+        Dept = CStr(objExchUser.Department)
+        Dept = Mid(Dept, InStrRev(Dept, "/", InStr(Dept, " ")) + 1, InStr(Dept, " ") - InStrRev(Dept, "/", InStr(Dept, " ")) - 1)
+        Name = CStr(objExchUser.Name)
+        Name = Mid(Name, 1, InStr(Name, " ") - 1)
+    
+    ElseIf objExchUser Is Nothing Then
+        eim = eim & CStr(objRecp.Name) & ","
+        GoTo CONTINUE
+    End If
+
+'条件分岐　ToかCcか
+    flg = objRecp.Type
+    Select Case flg
+        Case 1
+            Set sentenceTo = clsmdl.AddtoDict(Dept, Name)
+        Case 2
+            Set sentenceCc = clsmdl.AddtoDict(Dept, Name)
+    End Select
+CONTINUE:
+Next
+
+'辞書の値を改行しながら結合
+If IsEmpty(sentenceTo) = False Then
+    tostrings = clsmdl.DictionaryDeployment(sentenceTo)
+End If
+
+If IsEmpty(sentenceCc) = False Then
+    ccstrings = clsmdl.DictionaryDeployment(sentenceCc)
+End If
+
+'宛先文章を現在開いているメールのカーソル位置に書き込み　それまでの書式は保存
+Set objDoc = Item.GetInspector().WordEditor
+
+Select Case StrPtr(tostrings)
+    Case Is <> 0
+        If ccstrings <> "" Then
+            objDoc.Application.Selection.TypeText "To:" & Chr(10) & tostrings & Chr(10) & "Cc:" & Chr(10) & ccstrings
+        ElseIf ccstrings = "" Then
+            objDoc.Application.Selection.TypeText "To:" & Chr(10) & tostrings
+        End If
+    
+    Case Is = 0
+        If ccstrings <> "" Then
+            objDoc.Application.Selection.TypeText "Cc:" & Chr(10) & ccstrings
+        End If
+    End Select
+    
+'Exchangeサーバに部署名と名前が無い方の処理をスキップした旨通知
+If eim <> "" Then
+    MsgBox ("以下の方は名前と部署情報がExchangeサーバにないため，宛名作成できませんでした。恐れ入りますがご自身で宛先に追加下さい。" & eim)
+End If
+
+'Public変数の初期化クラスモジュールの再度呼び出し
+Call clsmdl.PublicValueInitialize
+
+Err:
+Call Erhdl
+
+End Sub
+Function PublicValueInitialize()
+Set ToDict = New Scripting.Dictionary
+Set CcDict = New Scripting.Dictionary
+flg = 0
+cnt = 0
+sen = ""
+Set sentenceTo = New Scripting.Dictionary
+Set sentenceCc = New Scripting.Dictionary
+tostrings = ""
+ccstrings = ""
+Dept = ""
+Name = ""
+
+End Function
+Function AddtoDict(ByVal Key As Variant, ByVal Name As Variant) As Scripting.Dictionary
+'条件分岐　ToかCcか
+Select Case flg
+    Case 1
+'初出部署の場合は、辞書に部署名:名前+様を格納
+        If ToDict.Exists(Key) = False Then
+            ToDict.Add Key, Key & ":" & Name & "様"
+'既出部署の場合は、部署に該当する要素の後ろに名前+様を追記
+        ElseIf ToDict.Exists(Key) = True Then
+            ToDict(Key) = ToDict(Key) & "," & Name & "様"
+        End If
+        Set AddtoDict = ToDict
+     Case 2
+'Case1と同様の分岐処理
+        If CcDict.Exists(Key) = False Then
+            CcDict.Add Key, Key & ":" & Name & "様"
+        ElseIf CcDict.Exists(Key) = True Then
+            CcDict(Key) = CcDict(Key) & "," & Name & "様"
+        End If
+        Set AddtoDict = CcDict
+    End Select
+    
+End Function
+Function DictionaryDeployment(ByVal Dict As Scripting.Dictionary) As String
+Dim sentence As String
+
+For Each Dept In Dict
+    If sentence = "" Then
+        sentence = Dict(Dept)
+    ElseIf sentence <> "" Then
+        sentence = sentence & Chr(10) & Dict(Dept)
+    End If
+Next
+
+DictionaryDeployment = sentence
+
+sentence = ""
+
+End Function
+Function Erhdl()
+    Select Case Err.Number
+        Case 91
+            MsgBox "エラー:対象メールウインドウを開いて実行してください"
+    End Select
+End Function
+
+
+
+
+
+
