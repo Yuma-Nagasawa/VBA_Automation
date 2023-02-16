@@ -14,9 +14,9 @@ Sub SearchAddressBook()
     Set olApp = Outlook.Application
     Set olMail = olApp.CreateItem(olMailItem)
     Set xlApp = New Excel.Application
-    Set xlWbk = xlApp.Workbooks.Open("対象者の氏名と部署が書かれたExcelファイルのパスを入れてください")
+    Set xlWbk = xlApp.Workbooks.Open(対象者の部署、氏名が記載されたExcelのパス")
     Set xlWsh = xlWbk.Worksheets("Sheet1")
-    Set xlRng = xlWsh.Range("A2:B3")
+    Set xlRng = xlWsh.Range("A2:B16")
 
     For i = 1 To xlRng.Rows.Count
         recipientname = xlRng.Cells(i, 1).Value
@@ -27,10 +27,12 @@ Sub SearchAddressBook()
         Dept = Mid(Dept, InStrRev(Dept, "/", InStr(Dept, " ")) + 1, InStr(Dept, " ") - InStrRev(Dept, "/", InStr(Dept, " ")) - 1)
         If Recipient.Resolved And StrConv(Dept, vbNarrow) = StrConv(department, vbNarrow) Then
             olMail.Recipients.Add (Recipient)
+            xlRng.Cells(i, 3).Value = Recipient.AddressEntry.GetExchangeUser.PrimarySmtpAddress
         End If
     Next
 
     olMail.Display
+    xlWbk.Save
     xlWbk.Close False
     xlApp.Quit
     Set xlWsh = Nothing
