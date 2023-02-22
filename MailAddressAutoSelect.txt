@@ -1,44 +1,73 @@
+Option Explicit
 Sub SearchAddressBook()
-    Dim olApp As Outlook.Application
-    Dim olMail As Outlook.MailItem
-    Dim xlApp As Excel.Application
-    Dim xlWbk As Excel.Workbook
-    Dim xlWsh As Excel.Worksheet
-    Dim xlRng As Excel.Range
-    Dim Recipient As Object
-    Dim recipientname As String
-    Dim department As String
-    Dim i As Integer
-    Dim Dept As String
 
-    Set olApp = Outlook.Application
-    Set olMail = olApp.CreateItem(olMailItem)
-    Set xlApp = New Excel.Application
-    Set xlWbk = xlApp.Workbooks.Open(対象者の部署、氏名が記載されたExcelのパス")
-    Set xlWsh = xlWbk.Worksheets("Sheet1")
-    Set xlRng = xlWsh.Range("A2:B16")
+Dim olApp As Outlook.Application
+Dim olMail As Outlook.MailItem
+Dim xlApp As Excel.Application
+Dim xlWbk As Excel.Workbook
+Dim xlWsh As Excel.Worksheet
+Dim xlRng As Excel.Range
+Dim Recipient As Object
+Dim Recipientname As String
+Dim Department As String
+Dim i As Integer
+Dim Departforresolve As String
+Dim Failfindrecipients As String
 
-    For i = 1 To xlRng.Rows.Count
-        recipientname = xlRng.Cells(i, 1).Value
-        department = xlRng.Cells(i, 2).Value
-        Set Recipient = olApp.Session.CreateRecipient(recipientname)
-        Recipient.Resolve
-        Dept = Recipient.AddressEntry.GetExchangeUser.department
-        Dept = Mid(Dept, InStrRev(Dept, "/", InStr(Dept, " ")) + 1, InStr(Dept, " ") - InStrRev(Dept, "/", InStr(Dept, " ")) - 1)
-        If Recipient.Resolved And StrConv(Dept, vbNarrow) = StrConv(department, vbNarrow) Then
-            olMail.Recipients.Add (Recipient)
-            xlRng.Cells(i, 3).Value = Recipient.AddressEntry.GetExchangeUser.PrimarySmtpAddress
+'処理中Excel更新オフ
+Application.ScreenUpdating = False
+
+'Outlook,Excelオブジェクト変数の設定
+Set olApp = Outlook.Application
+Set olMail = olApp.CreateItem(olMailItem)
+Set xlWbk = ThisWorkbook
+Set xlWsh = xlWbk.Worksheets("！シート名を入力してください")
+
+'対象者氏名及び部署記入シート記載の氏名及び課略称を用いて，Exchangeサーバで名前解決する。(目安速度:100人/1分)
+For i = 2 To xlWsh.Cells(Rows.Count, 1).End(xlUp).Row
+    Recipientname = Cells(i, 1).Value
+    Department = Cells(i, 2).Value
+        
+'Recipientnameを用いて名前解決
+    Set Recipient = olApp.Session.CreateRecipient(Recipientname)
+    Recipient.Resolve
+        
+'名前解決できた場合はサーバから課名取出し
+    If Recipient.Resolved Then
+        Departforresolve = Recipient.AddressEntry.GetExchangeUser.Department
+        If InStr(Departforresolve, "/") <> 0 Then
+            Departforresolve = Mid(Departforresolve, InStrRev(Departforresolve, "/", InStr(Departforresolve, " ")) + 1, InStr(Departforresolve, " ") - InStrRev(Departforresolve, "/", InStr(Departforresolve, " ")) - 1)
         End If
-    Next
+'サーバから取り出した課名とExcel記入の課名を照合し、整合する場合は宛先追加及びExcelにアドレス記入
+        If StrConv(Departforresolve, vbNarrow) = StrConv(Department, vbNarrow) Then
+            olMail.Recipients.Add (Recipient)
+            Cells(i, 3).Value = Recipient.AddressEntry.GetExchangeUser.PrimarySmtpAddress
+'整合しない場合，メッセージボックスで氏名を表示
+        Else
+            Failfindrecipients = Failfindrecipients & vbLf & Recipientname
+            Cells(i, 3).Value = "左の氏名と課の組合せからは対象者が見つかりませんでした。"
+        End If
+    Else
+        Failfindrecipients = Failfindrecipients & vbLf & Recipientname
+        Cells(i, 3).Value = "左の氏名と課の組合せからは対象者が見つかりませんでした。"
+    End If
 
-    olMail.Display
-    xlWbk.Save
-    xlWbk.Close False
-    xlApp.Quit
-    Set xlWsh = Nothing
-    Set xlWbk = Nothing
-    Set xlApp = Nothing
-    Set olMail = Nothing
-    Set olApp = Nothing
-    Set Recipient = Nothing
+Next
+
+If Failfindrecipients <> "" Then
+    MsgBox ("次の方の情報はExchangeサーバから見つかりませんでした。恐れ入りますが手動で宛先設定して下さい:" & vbLf & Failfindrecipients)
+End If
+
+'メール出力してExcel保存
+olMail.Display
+xlWbk.Save
+
+'オブジェクト変数クリア，処理中Excel更新オンに戻す
+Set xlWsh = Nothing
+Set xlWbk = Nothing
+Set olMail = Nothing
+Set olApp = Nothing
+Set Recipient = Nothing
+Application.ScreenUpdating = True
+
 End Sub
