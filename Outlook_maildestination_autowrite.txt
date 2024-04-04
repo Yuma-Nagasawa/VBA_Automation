@@ -31,9 +31,13 @@ Set Item = Application.ActiveInspector.CurrentItem
 For Each objRecp In Item.Recipients
     Set objExchUser = objRecp.AddressEntry.GetExchangeUser()
 
-    If Not objExchUser Is Nothing Then
+   If Not objExchUser Is Nothing Then
         Dept = CStr(objExchUser.Department)
-        Dept = Mid(Dept, InStrRev(Dept, "/", InStr(Dept, " ")) + 1, InStr(Dept, " ") - InStrRev(Dept, "/", InStr(Dept, " ")) - 1)
+        If InStr(Dept, "/") = 0 Then
+            Dept = Dept
+        Else
+            Dept = Mid(Dept, InStrRev(Dept, "/", InStr(Dept, " ")) + 1, InStr(Dept, " ") - InStrRev(Dept, "/", InStr(Dept, " ")) - 1)
+        End If
         Name = CStr(objExchUser.Name)
         Name = Mid(Name, 1, InStr(Name, " ") - 1)
     
