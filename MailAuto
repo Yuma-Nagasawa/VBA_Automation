@@ -1,0 +1,317 @@
+#ThisOutlookSession
+Option Explicit
+
+Private WithEvents InspCol As Outlook.Inspectors
+
+Private Sub Application_Startup()
+    Set InspCol = Application.Inspectors
+End Sub
+
+Private Sub InspCol_NewInspector(ByVal Inspector As Outlook.Inspector)
+    On Error GoTo EH
+    ' 返信作成ウィンドウが開いた直後は初期化中のため、モジュール側の遅延キックを呼ぶ
+    modReplyHelpers.KickInsert   ' ← モジュール名を完全修飾
+    Exit Sub
+EH:
+    MsgBox "NewInspector error: " & Err.Number & " / " & Err.Description, vbExclamation
+End Sub
+
+Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
+    On Error Resume Next
+    If TypeName(Item) <> "MailItem" Then Exit Sub
+
+    Dim mail As Outlook.MailItem: Set mail = Item
+    If mail Is Nothing Then Exit Sub
+
+    If Not modReplyHelpers.RecipientsMatchHeader(mail) Then ' ← 完全修飾
+        If MsgBox("本文先頭の宛先ブロックと To/Cc/Bcc が一致しません。送信を中止しますか？", _
+                  vbExclamation + vbYesNo, "宛先照合") = vbYes Then
+            Cancel = True
+        End If
+    End If
+End Sub
+
+#module modReplyHelpers
+'===== Module2: 宛先ヘッダー処理（安定版・完成）=====
+Option Explicit
+
+' 参照設定（VBE→ツール→参照設定）:
+'  - Microsoft Scripting Runtime
+'  - Microsoft Word 1x.0 Object Library
+
+' ---- モジュールレベル辞書 ----
+Private mToDict      As Scripting.Dictionary
+Private mCcDict      As Scripting.Dictionary
+Private mSentenceTo  As Scripting.Dictionary
+Private mSentenceCc  As Scripting.Dictionary
+
+' 独自マーカー（本文重複防止）★生の文字列で！
+Private Const HDR_MARK_HTML As String = "<!-- COPILOT_ADDR_HEADER -->"
+Private Const HDR_MARK_TEXT As String = "[COPILOT_ADDR_HEADER]"
+
+'========== 遅延キック ==========
+Public Sub KickInsert()
+    ' 150ms 遅延（署名ロード等の猶予）
+    Dim t As Single: t = Timer
+    Do While Timer - t < 0.15
+        DoEvents
+    Loop
+
+    On Error GoTo EH
+
+    Dim insp As Outlook.Inspector
+    Set insp = Application.ActiveInspector
+    If insp Is Nothing Then Exit Sub
+    If TypeName(insp.CurrentItem) <> "MailItem" Then Exit Sub
+
+    Dim mail As Outlook.MailItem
+    Set mail = insp.CurrentItem
+    If mail Is Nothing Then Exit Sub
+
+    If Not mail.Sent And Len(mail.EntryID) = 0 And mail.MessageClass Like "IPM.Note*" Then
+        ' WordEditor準備待ち（最大2秒）
+        Call WaitWordEditorReady(insp, 40, 0.05) ' 取れなくてもHTML直編集でフォールバック可
+
+        ' 宛先解決＋少し待つ（多数宛先対策）
+        On Error Resume Next
+        mail.Recipients.ResolveAll
+        On Error GoTo 0
+        t = Timer: Do While Timer - t < 0.2: DoEvents: Loop
+
+        InsertAddresseeHeader mail
+    End If
+    Exit Sub
+EH:
+    MsgBox "KickInsert error: " & Err.Number & " / " & Err.Description, vbExclamation
+End Sub
+
+Private Function WaitWordEditorReady(ByVal insp As Outlook.Inspector, _
+                                     ByVal maxTry As Long, _
+                                     ByVal stepSec As Double) As Boolean
+    Dim i As Long
+    For i = 1 To maxTry
+        On Error Resume Next
+        If insp.EditorType = olEditorWord Then
+            Dim doc As Word.Document
+            Set doc = insp.WordEditor
+            If Not doc Is Nothing Then
+                WaitWordEditorReady = True
+                Exit Function
+            End If
+        End If
+        On Error GoTo 0
+        Dim t As Single: t = Timer
+        Do While Timer - t < stepSec
+            DoEvents
+        Loop
+    Next
+    WaitWordEditorReady = False
+End Function
+
+'========== 共通ユーティリティ ==========
+Private Function TrimDept(ByVal deptIn As String) As String
+    Dim d As String
+    d = deptIn & ""
+    If Len(d) = 0 Then
+        TrimDept = ""
+    ElseIf InStr(d, "/") > 0 Then
+        TrimDept = Mid$(d, InStrRev(d, "/") + 1)
+    Else
+        TrimDept = d
+    End If
+End Function
+
+Private Function TrimSurname(ByVal displayName As String) As String
+    Dim n As String, p As Long
+    n = Trim$(displayName & "")
+    p = InStr(n, " ")
+    If p > 0 Then
+        TrimSurname = Left$(n, p - 1)
+    Else
+        TrimSurname = n
+    End If
+End Function
+
+Private Sub AddToDictX(ByVal Key As String, ByVal nm As String, _
+                       ByRef d As Scripting.Dictionary, _
+                       ByRef outCopy As Scripting.Dictionary)
+    If Not d.Exists(Key) Then
+        d.Add Key, Key & ":" & nm & "さん"
+    Else
+        d(Key) = d(Key) & "," & nm & "さん"
+    End If
+    outCopy.RemoveAll
+    Dim k As Variant
+    For Each k In d.Keys
+        outCopy.Add k, d(k)
+    Next
+End Sub
+
+Private Function DictToLines(ByVal d As Scripting.Dictionary) As String
+    Dim k As Variant, s As String
+    If d Is Nothing Then Exit Function
+    For Each k In d.Keys
+        If Len(s) = 0 Then s = d(k) Else s = s & vbCrLf & d(k)
+    Next
+    DictToLines = s
+End Function
+
+Private Function BuildHeaderText(ByVal toStr As String, ByVal ccStr As String) As String
+    Dim buf As String
+    If Len(toStr) > 0 Then buf = "To:" & vbCrLf & toStr & vbCrLf
+    If Len(ccStr) > 0 Then buf = buf & "Cc:" & vbCrLf & ccStr & vbCrLf
+    BuildHeaderText = buf
+End Function
+
+'========== A) 宛先ヘッダーを本文先頭に挿入 ==========
+Public Sub InsertAddresseeHeader(ByVal Item As Outlook.MailItem)
+    
+    MsgBox "[DEBUG] InsertAddresseeHeader CALLED"
+    MsgBox "[DEBUG] Recipients.Count=" & Item.Recipients.Count
+
+    On Error GoTo ErrH
+
+    ' 辞書初期化
+    Set mToDict = New Scripting.Dictionary
+    Set mCcDict = New Scripting.Dictionary
+    Set mSentenceTo = New Scripting.Dictionary
+    Set mSentenceCc = New Scripting.Dictionary
+
+    ' --- 受信者走査 ---
+    Dim r As Outlook.Recipient, ex As Outlook.ExchangeUser
+    For Each r In Item.Recipients
+        Set ex = Nothing
+        On Error Resume Next: Set ex = r.AddressEntry.GetExchangeUser: On Error GoTo 0
+
+        Dim dept As String, nm As String
+        If Not ex Is Nothing Then
+            dept = TrimDept(CStr(ex.Department))
+            nm = TrimSurname(CStr(ex.Name))
+        Else
+            dept = "（部署不明）": nm = r.Name
+        End If
+
+        Select Case r.Type
+            Case olTo:  AddToDictX dept, nm, mToDict, mSentenceTo
+            Case olCC:  AddToDictX dept, nm, mCcDict, mSentenceCc
+            Case Else   ' BCC は見出し出力しない
+        End Select
+    Next
+
+    ' --- ここで宣言してから長さ確認（順番が重要）---
+    Dim toStr As String, ccStr As String
+    toStr = DictToLines(mSentenceTo)
+    ccStr = DictToLines(mSentenceCc)
+    ' MsgBox "[DEBUG] Len(To)=" & Len(toStr) & " / Len(Cc)=" & Len(ccStr)
+
+    ' ===== 本文先頭へ必ず挿入（独自マーカーで二重判定）=====
+    Select Case Item.BodyFormat
+        Case olFormatHTML
+            Call InsertToHtmlTop(Item, toStr, ccStr)
+
+        Case olFormatRichText, olFormatUnspecified
+            Dim wd As Word.Document
+            Set wd = Item.GetInspector.WordEditor
+            If InStr(1, Left$(wd.Range(0, 500).Text, 500), "COPILOT_ADDR_HEADER", vbTextCompare) = 0 Then
+                wd.Range(0, 0).InsertBefore HDR_MARK_TEXT & vbCrLf & BuildHeaderText(toStr, ccStr) & vbCrLf
+            End If
+
+        Case olFormatPlain
+            Dim bodyHeader As String
+            bodyHeader = BuildHeaderText(toStr, ccStr) & vbCrLf
+            If InStr(1, Left$(Item.Body, 500), "COPILOT_ADDR_HEADER", vbTextCompare) = 0 Then
+                Item.Body = HDR_MARK_TEXT & vbCrLf & bodyHeader & Item.Body
+                Item.Save
+            End If
+    End Select
+
+    Exit Sub
+ErrH:
+    MsgBox "InsertAddresseeHeader error: " & Err.Number & " / " & Err.Description, vbExclamation
+End Sub
+
+Private Sub InsertToHtmlTop(ByVal Item As Outlook.MailItem, _
+                            ByVal toStr As String, ByVal ccStr As String)
+    
+    MsgBox "[DEBUG] HTML len=" & Len(Item.HTMLBody)
+    MsgBox "[DEBUG] p=" & InStr(1, Item.HTMLBody, "<body", vbTextCompare)
+    
+    On Error GoTo EH
+
+    Dim html As String
+    html = Item.HTMLBody
+
+    If InStr(1, html, HDR_MARK_HTML, vbTextCompare) = 0 Then
+        Dim hdr As String, hdrHtml As String
+        hdr = BuildHeaderText(toStr, ccStr)
+        hdrHtml = HDR_MARK_HTML & "<p>" & Replace(hdr, vbCrLf, "<br>") & "<br></p>"
+
+        ' <body ...> の直後
+        Dim p As Long, q As Long
+        p = InStr(1, html, "<body", vbTextCompare)
+        If p > 0 Then
+            q = InStr(p, html, ">", vbTextCompare)
+            If q > 0 Then
+                html = Left$(html, q) & hdrHtml & Mid$(html, q + 1)
+            Else
+                html = hdrHtml & html
+            End If
+        Else
+            html = hdrHtml & html
+        End If
+
+        Item.HTMLBody = html
+        Item.Save
+    End If
+    Exit Sub
+EH:
+    ' フォールバック：WordEditor の先頭へ
+    On Error Resume Next
+    Dim wd As Word.Document
+    Set wd = Item.GetInspector.WordEditor
+    If Not wd Is Nothing Then
+        wd.Range(0, 0).InsertBefore HDR_MARK_TEXT & vbCrLf & BuildHeaderText(toStr, ccStr) & vbCrLf
+    End If
+End Sub
+
+'========== C) 送信直前：本文先頭の表記と To/Cc を突合 ==========
+Public Function RecipientsMatchHeader(ByVal Item As Outlook.MailItem) As Boolean
+    Dim regenTo As String, regenCc As String
+    regenTo = RebuildSentence(Item, olTo)
+    regenCc = RebuildSentence(Item, olCC)
+
+    Dim wd As Word.Document: Set wd = Item.GetInspector.WordEditor
+    Dim headerText As String
+    On Error Resume Next
+    headerText = Left$(wd.Range(0, 1200).Text, 1200)
+    On Error GoTo 0
+
+    RecipientsMatchHeader = (Len(regenTo) = 0 Or InStr(headerText, regenTo) > 0) _
+                         And (Len(regenCc) = 0 Or InStr(headerText, regenCc) > 0)
+End Function
+
+Private Function RebuildSentence(ByVal Item As Outlook.MailItem, ByVal kind As OlMailRecipientType) As String
+    Dim d As New Scripting.Dictionary
+    Dim r As Outlook.Recipient, ex As Outlook.ExchangeUser
+    For Each r In Item.Recipients
+        If r.Type = kind Then
+            Set ex = Nothing
+            On Error Resume Next: Set ex = r.AddressEntry.GetExchangeUser: On Error GoTo 0
+
+            Dim dep As String, nm As String
+            If Not ex Is Nothing Then
+                dep = TrimDept(ex.Department)
+                nm = TrimSurname(ex.Name)
+            Else
+                dep = "（部署不明）": nm = r.Name
+            End If
+
+            If Not d.Exists(dep) Then
+                d.Add dep, dep & ":" & nm & "さん"
+            Else
+                d(dep) = d(dep) & "," & nm & "さん"
+            End If
+        End If
+    Next
+    RebuildSentence = DictToLines(d)
+End Function
