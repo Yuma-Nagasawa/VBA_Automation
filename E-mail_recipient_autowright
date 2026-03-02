@@ -1,0 +1,417 @@
+' Microsoft Outlook ObjectsのThisOutlookSessionに貼り付け
+Option Explicit
+
+' [A] 追加：現在の返信ウィンドウだけを監視する Inspector（1つ）
+Private WithEvents gInspCur As Outlook.Inspector
+Private mActivateHooked As Boolean
+
+' 宣言部に追加（TEST無効化）
+Private Const PREFIX_TEXT As String = ""
+
+' [1] 先頭の宣言部に追加（既存 Option Explicit の直下）
+Private WithEvents gExplorer As Outlook.Explorer
+Private mInReplySwitch As Boolean
+
+'=== イベント層（1つだけ） ===
+Private WithEvents gInspectors As Outlook.Inspectors
+
+' [2] Application_Startup を差し替え（gInspectors の設定は既存のまま保持）
+' [3] Explorer のインライン返信イベントを追加
+
+Private Sub Application_Startup()
+    Set gInspectors = Application.Inspectors
+
+
+' [+] Application_Startup の末尾に1回だけの遅延フック（任意）
+    Dim t As Single: t = Timer
+    Do While gExplorer Is Nothing And Timer - t < 1#
+        DoEvents
+        On Error Resume Next
+        Set gExplorer = Application.ActiveExplorer
+        On Error GoTo 0
+    Loop
+
+End Sub
+
+' [B] 置換：NewInspector では挿入せず、「監視をセット」だけにする
+Private Sub gInspectors_NewInspector(ByVal Inspector As Outlook.Inspector)
+    Dim mi As Outlook.MailItem
+    If TypeOf Inspector.CurrentItem Is Outlook.MailItem Then
+        Set mi = Inspector.CurrentItem
+        If mi.Sent = False Then
+            If IsReply(mi) Then
+                Set gInspCur = Inspector   ' ← この Inspector の Activate を受ける
+                mActivateHooked = True
+            End If
+        End If
+    End If
+End Sub
+
+
+'=== ロジック層 ===
+Private Function IsReply(ByVal mi As Outlook.MailItem) As Boolean
+    Dim s As String
+    s = UCase$(Trim$(mi.Subject))
+
+' [~] 置換：IsReply の最終行のみ
+    IsReply = (Left$(s, 3) = "RE:" Or Left$(s, 4) = "ＲＥ:" Or Left$(s, 4) = "Re:")
+
+End Function
+Private Sub InsertPrefixOnce(ByVal insp As Outlook.Inspector, _
+                             ByVal mi As Outlook.MailItem, _
+                             ByVal prefix As String)
+    On Error GoTo FailFast
+
+    ' 冪等刻印
+    Dim up As Outlook.UserProperty
+    Set up = mi.UserProperties.Find("PrefixInserted", True)
+    If up Is Nothing Then
+        Set up = mi.UserProperties.Add("PrefixInserted", olYesNo, True)
+        up.Value = False
+    End If
+    If up.Value = True Then Exit Sub
+
+    ' Word 初期化待機（最大1秒）
+    If Not insp.IsWordMail Then Exit Sub
+    Dim t As Single: t = Timer
+    Do While (insp.WordEditor Is Nothing)
+        DoEvents
+        If Timer - t > 1# Then Exit Sub
+    Loop
+
+    ' 先頭へ一回だけ挿入
+    Dim doc As Word.Document
+    Dim rng As Word.Range
+    Set doc = insp.WordEditor
+    If Left$(doc.Content.Text, Len(prefix)) <> prefix Then
+        Set rng = doc.Range(0, 0)
+        rng.InsertBefore prefix & vbCrLf
+    End If
+
+    up.Value = True
+    mi.Save
+    Exit Sub
+
+FailFast:
+    ' ここでは握りつぶさない：開発時は即発見
+    Err.Clear
+End Sub
+
+' Explorer が切り替わったときも購読を維持
+Private Sub Application_ActiveExplorer(ByVal Explorer As Explorer)
+    Set gExplorer = Explorer
+End Sub
+
+
+' [C] 追加：表示完了(Activate)で1回だけ本挿入を実行する
+Private Sub gInspCur_Activate()
+    On Error GoTo ExitHere
+    If Not mActivateHooked Then Exit Sub
+
+    Dim mi As Outlook.MailItem
+    If TypeOf gInspCur.CurrentItem Is Outlook.MailItem Then
+        Set mi = gInspCur.CurrentItem
+
+
+        ' --- ここで初めて実挿入（本文が展開済み） ---
+        InsertPrefixOnce gInspCur, mi, "TEST"
+        
+        ' 追加（この1行のみ）：
+        modCleanupPrefix.RemovePrefixIfPresent gInspCur, mi, "TEST"
+        modRecipientBlock.InsertRecipientBlockOnce gInspCur, mi
+        If Len(PREFIX_TEXT) > 0 Then InsertPrefixOnce gInspCur, mi, PREFIX_TEXT
+        
+    End If
+
+ExitHere:
+    ' 1回で解除（多重呼び出し防止）
+    mActivateHooked = False
+    Set gInspCur = Nothing
+End Sub
+
+Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
+    If TypeName(Item) <> "MailItem" Then Exit Sub
+    If Not modRecipientGuard.RecipientsMatchHeader(Item) Then
+        If MsgBox("先頭の宛先ブロックと To/Cc が一致しません。送信を中止しますか？", _
+                  vbExclamation + vbYesNo, "宛先照合") = vbYes Then
+            Cancel = True
+        End If
+    End If
+End Sub
+
+' Module　modCleanupPrefix
+Option Explicit
+
+Public Sub RemovePrefixIfPresent(ByVal insp As Outlook.Inspector, _
+                                 ByVal mi As Outlook.MailItem, _
+                                 ByVal prefix As String)
+    On Error Resume Next
+    If Len(prefix) = 0 Then Exit Sub
+
+    If insp.IsWordMail Then
+        Dim doc As Word.Document: Set doc = insp.WordEditor
+        Dim txt As String: txt = doc.Content.Text
+        If Left$(txt, Len(prefix)) = prefix Then
+            Dim n As Long: n = Len(prefix)
+            If Mid$(txt, n + 1, 2) = vbCrLf Then n = n + 2
+            doc.Range(0, n).Delete
+        End If
+    ElseIf Len(mi.HTMLBody) > 0 Then
+        Dim h As String: h = mi.HTMLBody
+        If Left$(h, Len(prefix)) = prefix Then
+            Dim rest As String: rest = Mid$(h, Len(prefix) + 1)
+            rest = LTrim$(rest)
+            If LCase$(Left$(rest, 5)) = "<br/>" Then rest = Mid$(rest, 6)
+            If LCase$(Left$(rest, 4)) = "<br>" Then rest = Mid$(rest, 5)
+            mi.HTMLBody = rest
+        End If
+    Else
+        Dim b As String: b = mi.body
+        If Left$(b, Len(prefix)) = prefix Then
+            If Mid$(b, Len(prefix) + 1, 2) = vbCrLf Then
+                mi.body = Mid$(b, Len(prefix) + 3)
+            Else
+                mi.body = Mid$(b, Len(prefix) + 1)
+            End If
+        End If
+    End If
+    mi.Save
+End Sub
+
+'module modRecipientBlock
+Option Explicit
+
+Public Sub InsertRecipientBlockOnce(ByVal insp As Outlook.Inspector, ByVal mi As Outlook.MailItem)
+    On Error GoTo ExitHere
+    Dim up As Outlook.UserProperty, block As String, cc As String
+    Set up = mi.UserProperties.Find("RecipientBlockInserted", True)
+    If up Is Nothing Then Set up = mi.UserProperties.Add("RecipientBlockInserted", olYesNo, True)
+    If up.Value = True Then Exit Sub
+
+    block = BlockForType(mi, olTo, "To:")
+    cc = BlockForType(mi, olCC, "Cc:")
+    If Len(cc) > 0 Then block = block & cc
+    If Len(block) = 0 Then Exit Sub
+
+    If insp.IsWordMail Then
+        Dim doc As Word.Document, rng As Word.Range
+        Set doc = insp.WordEditor: Set rng = doc.Range(0, 0)
+        If Left$(doc.Content.Text, Len(block)) <> block Then rng.InsertBefore block & vbCrLf
+    ElseIf Len(mi.HTMLBody) > 0 Then
+        If Left$(mi.HTMLBody, Len(block)) <> block Then mi.HTMLBody = block & "<br>" & mi.HTMLBody
+    Else
+        If Left$(mi.body, Len(block)) <> block Then mi.body = block & vbCrLf & mi.body
+    End If
+    up.Value = True: mi.Save
+ExitHere:
+End Sub
+
+Private Function BlockForType(ByVal mi As Outlook.MailItem, ByVal typ As OlMailRecipientType, ByVal head As String) As String
+    Dim d As Object, i As Long, r As Outlook.Recipient, k As Variant, s As String
+    Set d = CreateObject("Scripting.Dictionary")
+    For i = 1 To mi.Recipients.Count
+        Set r = mi.Recipients(i)
+        If r.Type = typ Then
+            Dim dep As String, nm As String
+            dep = GetDeptSmart(r): nm = GetShortName(r)
+            If Len(dep) = 0 Then dep = "（部署不明）"
+            If Not d.Exists(dep) Then d(dep) = nm & "さん" Else d(dep) = d(dep) & "、" & nm & "さん"
+        End If
+    Next
+    For Each k In d.Keys
+        If Len(s) > 0 Then s = s & vbCrLf
+        s = s & k & ":" & d(k)
+    Next
+    If Len(s) > 0 Then BlockForType = head & vbCrLf & s & vbCrLf
+End Function
+
+' [~] 追加（または GetDept をこの実装に置換）
+Private Function GetDeptSmart(ByVal rc As Outlook.Recipient) As String
+    On Error Resume Next
+    Dim dep As String
+    Dim eu As Outlook.ExchangeUser
+    Dim pa As Outlook.PropertyAccessor
+    Dim dl As Outlook.ExchangeDistributionList
+
+    ' 1) GAL: ExchangeUser.Department
+    Set eu = rc.AddressEntry.GetExchangeUser
+    If Not eu Is Nothing Then
+        If LenB(eu.Department) > 0 Then dep = eu.Department
+        ' 一部環境では OfficeLocation にコードが入る
+        If LenB(dep) = 0 And LenB(eu.OfficeLocation) > 0 Then dep = eu.OfficeLocation
+    End If
+
+    ' 2) MAPI 拡張: PR_DEPARTMENT_NAME / PR_OFFICE_LOCATION
+    If LenB(dep) = 0 Then
+        Set pa = rc.PropertyAccessor
+        If Not pa Is Nothing Then
+            If LenB(dep) = 0 Then dep = NzStr(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3A18001E")) ' Department
+            If LenB(dep) = 0 Then dep = NzStr(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3A19001E")) ' OfficeLocation
+        End If
+    End If
+
+    ' 3) 配布リストの場合
+    If LenB(dep) = 0 Then
+        Set dl = rc.AddressEntry.GetExchangeDistributionList
+        If Not dl Is Nothing Then dep = NzStr(dl.Department)
+    End If
+
+    ' 4) 表示名からの簡易推定（"部門/姓名" 等、末尾/先頭にコードがあるケース）
+    If LenB(dep) = 0 Then dep = GuessDeptFromDisplay(rc.Name)
+
+    ' 正規化（末尾抽出→大文字→全角）
+    GetDeptSmart = NormalizeDept(dep)
+End Function
+
+' [~] 置換１：NormalizeDept（多段正規化＋末尾優先＋NPQA優先）
+Private Function NormalizeDept(ByVal dep As String) As String
+    Dim s As String, i As Long, parts() As String, token As String, cand As String, t As String
+
+    s = dep
+    ' 1) 全角→半角で判定しやすく（表示は最後に全角へ戻す）
+    s = StrConv(s, vbNarrow)
+
+    ' 2) 区切り統一：さまざまな記号を "/" に寄せる
+    s = Replace(s, "／", "/")
+    s = Replace(s, "\", "/")
+    s = Replace(s, "|", "/"): s = Replace(s, "｜", "/")
+    s = Replace(s, "-", "/"): s = Replace(s, "－", "/")
+    s = Replace(s, "?", "/"): s = Replace(s, "―", "/"): s = Replace(s, "?", "/"): s = Replace(s, "ー", "/")
+    s = Replace(s, "?", "/"): s = Replace(s, "・", "/"): s = Replace(s, "・", "/"): s = Replace(s, "･", "/")
+
+    ' 3) 空白除去（半角/全角）
+    s = Replace(s, "　", "")
+    s = Replace(s, " ", "")
+
+    ' 4) 連続スラッシュの圧縮
+    Do While InStr(s, "//") > 0
+        s = Replace(s, "//", "/")
+    Loop
+
+    ' 5) 先頭/末尾のスラッシュ除去
+    Do While Left$(s, 1) = "/": s = Mid$(s, 2): Loop
+    Do While Right$(s, 1) = "/": s = Left$(s, Len(s) - 1): Loop
+
+    If Len(s) = 0 Then Exit Function
+
+    parts = Split(s, "/")
+
+    ' 6) 末尾から走査：最優先は NPQA（幅・大小無視）、なければ最初に見つかった非空トークン
+    For i = UBound(parts) To LBound(parts) Step -1
+        token = parts(i)
+        If Len(token) = 0 Then GoTo ContinueLoop
+
+        t = UCase$(token)
+        If InStr(t, "NPQA") > 0 Then
+            cand = token
+            Exit For
+        End If
+
+        If Len(cand) = 0 Then cand = token ' 非空の最初の候補を保持
+ContinueLoop:
+    Next i
+
+    ' 7) 見つからなければ空
+    If Len(cand) = 0 Then Exit Function
+
+    ' 8) 表示用に：半角→大文字→全角（NPQA→ＮＰＱＡ）
+    cand = UCase$(cand)
+    NormalizeDept = StrConv(cand, vbWide)
+End Function
+
+' [~] 置換２：GuessDeptFromDisplay（幅・大小無視で NPQA を検出）
+Private Function GuessDeptFromDisplay(ByVal disp As String) As String
+    Dim s As String: s = UCase$(StrConv(Trim$(disp), vbNarrow))
+    If InStr(s, "NPQA") > 0 Then
+        GuessDeptFromDisplay = "ＮＰＱＡ"
+    Else
+        GuessDeptFromDisplay = ""
+    End If
+End Function
+
+Private Function NzStr(ByVal v As Variant) As String
+    If IsError(v) Or IsNull(v) Then
+        NzStr = ""
+    Else
+        NzStr = CStr(v)
+    End If
+End Function
+
+
+Private Function GetShortName(ByVal rc As Outlook.Recipient) As String
+    On Error Resume Next
+    Dim eu As Outlook.ExchangeUser, nm As String
+    Set eu = rc.AddressEntry.GetExchangeUser
+    If Not eu Is Nothing Then nm = eu.Name Else nm = rc.Name
+    If InStr(nm, " ") > 0 Then nm = Left$(nm, InStr(nm, " ") - 1)
+    GetShortName = nm
+End Function
+
+' module modRecipientGuard
+Option Explicit
+
+Public Function RecipientsMatchHeader(mi As Outlook.MailItem) As Boolean
+    Dim body$, hdr$, p&, a As Object, b As Object, c As Object, d As Object
+    body = mi.body
+    Do While Left$(body, 2) = vbCrLf: body = Mid$(body, 3): Loop
+    If Left$(body, 3) <> "To:" Then RecipientsMatchHeader = True: Exit Function
+    p = InStr(body, vbCrLf & vbCrLf): hdr = IIf(p = 0, body, Left$(body, p - Len(vbCrLf)))
+    Set a = MakeSetFromHeader(hdr, "To:"): Set b = MakeSetFromHeader(hdr, "Cc:")
+    Set c = MakeSetFromRecipients(mi, olTo): Set d = MakeSetFromRecipients(mi, olCC)
+    RecipientsMatchHeader = SetsEqual(a, c) And SetsEqual(b, d)
+End Function
+
+Private Function MakeSetFromHeader(hdr$, head$) As Object
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    Dim lines() As String, i&, mode$
+    lines = Split(hdr, vbCrLf)
+    For i = LBound(lines) To UBound(lines)
+        If lines(i) = "To:" Then mode = "T": GoTo nxt
+        If lines(i) = "Cc:" Then mode = "C": GoTo nxt
+        If (head = "To:" And mode <> "T") Or (head = "Cc:" And mode <> "C") Then GoTo nxt
+        If InStr(lines(i), ":") > 0 Then
+            Dim s$, arr() As String, j&, nm$
+            s = Mid$(lines(i), InStr(lines(i), ":") + 1)
+            s = Replace(Replace(Replace(Replace(s, "さん", ""), " ", ""), "　", ""), "、", ",")
+            arr = Split(s, ",")
+            For j = LBound(arr) To UBound(arr)
+                nm = Trim$(arr(j)): If Len(nm) > 0 Then d(UCase$(StrConv(nm, vbNarrow))) = True
+            Next j
+        End If
+nxt:
+    Next i
+    Set MakeSetFromHeader = d
+End Function
+
+Private Function MakeSetFromRecipients(mi As Outlook.MailItem, typ As OlMailRecipientType) As Object
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    Dim i&, r As Outlook.Recipient, nm$, eu As Outlook.ExchangeUser
+    For i = 1 To mi.Recipients.Count
+        Set r = mi.Recipients(i)
+        If r.Type = typ Then
+            On Error Resume Next: Set eu = r.AddressEntry.GetExchangeUser
+            If Not eu Is Nothing Then nm = eu.Name Else nm = r.Name
+            nm = Replace(nm, "　", " "): If InStr(nm, " ") > 0 Then nm = Left$(nm, InStr(nm, " ") - 1)
+            d(UCase$(StrConv(nm, vbNarrow))) = True
+        End If
+    Next i
+    Set MakeSetFromRecipients = d
+End Function
+
+' [~] 差し替え：単行構文を廃し、安定形に
+Private Function SetsEqual(a As Object, b As Object) As Boolean
+    Dim k As Variant
+    ' どちらかが未生成なら不一致扱い
+    If a Is Nothing Or b Is Nothing Then Exit Function
+    ' 要素数が違えば不一致
+    If a.Count <> b.Count Then Exit Function
+
+    ' キー集合の完全一致を確認
+    For Each k In a.Keys
+        If Not b.Exists(k) Then
+            Exit Function
+        End If
+    Next k
+
+    SetsEqual = True
+End Function
