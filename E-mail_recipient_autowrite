@@ -350,68 +350,280 @@ End Function
 ' module modRecipientGuard
 Option Explicit
 
+' 宛先ブロックと実際の To/Cc が一致しているか判定
 Public Function RecipientsMatchHeader(mi As Outlook.MailItem) As Boolean
-    Dim body$, hdr$, p&, a As Object, b As Object, c As Object, d As Object
+    Dim body As String
+    Dim hdr As String
+    Dim p As Long
+    Dim toHdr As Object, ccHdr As Object
+    Dim toRcpt As Object, ccRcpt As Object
+    
     body = mi.body
-    Do While Left$(body, 2) = vbCrLf: body = Mid$(body, 3): Loop
-    If Left$(body, 3) <> "To:" Then RecipientsMatchHeader = True: Exit Function
-    p = InStr(body, vbCrLf & vbCrLf): hdr = IIf(p = 0, body, Left$(body, p - Len(vbCrLf)))
-    Set a = MakeSetFromHeader(hdr, "To:"): Set b = MakeSetFromHeader(hdr, "Cc:")
-    Set c = MakeSetFromRecipients(mi, olTo): Set d = MakeSetFromRecipients(mi, olCC)
-    RecipientsMatchHeader = SetsEqual(a, c) And SetsEqual(b, d)
+    ' 先頭の空行除去
+    Do While Left$(body, 2) = vbCrLf
+        body = Mid$(body, 3)
+    Loop
+    
+    ' 先頭に To: ブロックがなければチェック対象外
+    If Left$(body, 3) <> "To:" Then
+        RecipientsMatchHeader = True
+        Exit Function
+    End If
+    
+    ' To: ～ Cc: ブロック全体（空行まで）を切り出し
+    p = InStr(body, vbCrLf & vbCrLf)
+    If p = 0 Then
+        hdr = body
+    Else
+        hdr = Left$(body, p - Len(vbCrLf))
+    End If
+    
+    ' ヘッダ側セット
+    Set toHdr = MakeSetFromHeader(hdr, "To:")
+    Set ccHdr = MakeSetFromHeader(hdr, "Cc:")
+    
+    ' Recipients 側セット
+    Set toRcpt = MakeSetFromRecipients(mi, olTo)
+    Set ccRcpt = MakeSetFromRecipients(mi, olCC)
+    
+    RecipientsMatchHeader = SetsEqual(toHdr, toRcpt) And SetsEqual(ccHdr, ccRcpt)
 End Function
 
-Private Function MakeSetFromHeader(hdr$, head$) As Object
+
+'=== ヘッダ側：To:/Cc: ブロックから名前集合を作る ===
+Private Function MakeSetFromHeader(hdr As String, head As String) As Object
     Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
-    Dim lines() As String, i&, mode$
+    Dim lines() As String
+    Dim i As Long
+    Dim mode As String
+    Dim s As String
+    Dim arr() As String
+    Dim j As Long
+    Dim nm As String
+    
     lines = Split(hdr, vbCrLf)
+    
     For i = LBound(lines) To UBound(lines)
-        If lines(i) = "To:" Then mode = "T": GoTo nxt
-        If lines(i) = "Cc:" Then mode = "C": GoTo nxt
-        If (head = "To:" And mode <> "T") Or (head = "Cc:" And mode <> "C") Then GoTo nxt
+        If lines(i) = "To:" Then
+            mode = "T"
+            GoTo nxt
+        End If
+        If lines(i) = "Cc:" Then
+            mode = "C"
+            GoTo nxt
+        End If
+        
+        ' 対象ブロック以外はスキップ
+        If (head = "To:" And mode <> "T") Or (head = "Cc:" And mode <> "C") Then
+            GoTo nxt
+        End If
+        
+        ' 「部署:氏名さん、氏名さん…」形式の行
         If InStr(lines(i), ":") > 0 Then
-            Dim s$, arr() As String, j&, nm$
             s = Mid$(lines(i), InStr(lines(i), ":") + 1)
-            s = Replace(Replace(Replace(Replace(s, "さん", ""), " ", ""), "　", ""), "、", ",")
+            ' 名前区切りをカンマに統一（和文読点→カンマ）
+            s = Replace$(s, "、", ",")
+            
             arr = Split(s, ",")
             For j = LBound(arr) To UBound(arr)
-                nm = Trim$(arr(j)): If Len(nm) > 0 Then d(UCase$(StrConv(nm, vbNarrow))) = True
+                nm = Trim$(arr(j))
+                If Len(nm) > 0 Then
+                    nm = NormalizeNameForCompare(nm)
+                    If Len(nm) > 0 Then d(nm) = True
+                End If
             Next j
         End If
 nxt:
     Next i
+    
     Set MakeSetFromHeader = d
 End Function
 
-Private Function MakeSetFromRecipients(mi As Outlook.MailItem, typ As OlMailRecipientType) As Object
+
+'=== Recipients 側：MailItem.Recipients から名前集合を作る ===
+Private Function MakeSetFromRecipients(mi As Outlook.MailItem, _
+                                       typ As OlMailRecipientType) As Object
     Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
-    Dim i&, r As Outlook.Recipient, nm$, eu As Outlook.ExchangeUser
+    Dim i As Long
+    Dim r As Outlook.Recipient
+    Dim nm As String
+    Dim eu As Outlook.ExchangeUser
+    
     For i = 1 To mi.Recipients.Count
         Set r = mi.Recipients(i)
         If r.Type = typ Then
-            On Error Resume Next: Set eu = r.AddressEntry.GetExchangeUser
-            If Not eu Is Nothing Then nm = eu.Name Else nm = r.Name
-            nm = Replace(nm, "　", " "): If InStr(nm, " ") > 0 Then nm = Left$(nm, InStr(nm, " ") - 1)
-            d(UCase$(StrConv(nm, vbNarrow))) = True
+            nm = ""
+            On Error Resume Next
+            Set eu = r.AddressEntry.GetExchangeUser
+            If Not eu Is Nothing Then
+                nm = eu.Name
+            Else
+                nm = r.Name
+            End If
+            On Error GoTo 0
+            
+            nm = NormalizeNameForCompare(nm)
+            If Len(nm) > 0 Then d(nm) = True
         End If
     Next i
+    
     Set MakeSetFromRecipients = d
 End Function
 
-' [~] 差し替え：単行構文を廃し、安定形に
+
+'=== 名前正規化：漢字部分だけを比較キーにする ===
+' 例:
+'   "長澤雄真さん"                            -> "長澤雄真"
+'   "長澤雄真 / NAGASAWA, YUMA <...>"        -> "長澤雄真"
+Private Function NormalizeNameForCompare(ByVal raw As String) As String
+    Dim s As String
+    Dim p As Long
+    Dim kanji As String
+    
+    s = Trim$(raw)
+    If Len(s) = 0 Then GoTo Fail
+    
+    ' 全角スペース→半角スペース
+    s = Replace$(s, "　", " ")
+    
+    ' メールアドレス "<...>" 以降を削除
+    p = InStr(s, "<")
+    If p > 0 Then s = Left$(s, p - 1)
+    
+    ' 「漢字 / ローマ字」形式のローマ字部分を削除
+    p = InStr(s, " / ")
+    If p > 0 Then
+        s = Left$(s, p - 1)
+    Else
+        p = InStr(s, "／")
+        If p > 0 Then
+            s = Left$(s, p - 1)
+        Else
+            p = InStr(s, "/")
+            If p > 0 Then
+                s = Left$(s, p - 1)
+            End If
+        End If
+    End If
+    
+    s = Trim$(s)
+    If Len(s) = 0 Then GoTo Fail
+    
+    ' 先頭から連続する「漢字」だけを抽出（敬称「さん」「様」などは自動的に切り落とされる）
+    kanji = ExtractLeadingKanji(s)
+    If Len(kanji) > 0 Then
+        s = kanji
+    Else
+        ' 漢字が一つも無い場合は、先頭トークン（空白まで）を採用（英字名などのフォールバック）
+        p = InStr(s, " ")
+        If p > 0 Then s = Left$(s, p - 1)
+    End If
+    
+    s = Trim$(s)
+    If Len(s) = 0 Then GoTo Fail
+    
+    ' 比較用キー：半角＋大文字に統一
+    s = StrConv(s, vbNarrow)
+    s = UCase$(s)
+    
+    NormalizeNameForCompare = s
+    Exit Function
+Fail:
+    NormalizeNameForCompare = ""
+End Function
+
+
+' 文字列の先頭から連続する漢字だけを取り出す
+Private Function ExtractLeadingKanji(ByVal s As String) As String
+    Dim i As Long
+    Dim ch As String
+    Dim code As Long
+    Dim result As String
+    
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        code = AscW(ch)
+        code = (code And &HFFFF&)   ' AscW は 16bit 符号付きなので、0～65535 に正規化
+        
+        If IsKanjiCode(code) Then
+            result = result & ch
+        ElseIf Len(result) > 0 Then
+            ' 一度でも漢字を取り始めた後で非漢字が来たらそこで打ち切り
+            Exit For
+        End If
+    Next i
+    
+    ExtractLeadingKanji = result
+End Function
+
+' CJK 統合漢字ブロック（ざっくり）の判定
+Private Function IsKanjiCode(ByVal code As Long) As Boolean
+    ' U+4E00 ～ U+9FFF を漢字とみなす
+    IsKanjiCode = (code >= &H4E00 And code <= &H9FFF)
+End Function
+
+
+'=== 集合比較：キー集合が完全一致しているか（敬称などを吸収して比較） ===
 Private Function SetsEqual(a As Object, b As Object) As Boolean
+    Dim na As Object, nb As Object
     Dim k As Variant
-    ' どちらかが未生成なら不一致扱い
+
+    ' どちらかが Nothing なら不一致
     If a Is Nothing Or b Is Nothing Then Exit Function
+
+    ' まず、両方の辞書のキーを「比較用キー（敬称除去）」に正規化した新しい辞書を作る
+    Set na = CreateObject("Scripting.Dictionary")
+    For Each k In a.Keys
+        na(CanonicalKeyForCompare(CStr(k))) = True
+    Next k
+
+    Set nb = CreateObject("Scripting.Dictionary")
+    For Each k In b.Keys
+        nb(CanonicalKeyForCompare(CStr(k))) = True
+    Next k
+
     ' 要素数が違えば不一致
-    If a.Count <> b.Count Then Exit Function
+    If na.Count <> nb.Count Then Exit Function
 
     ' キー集合の完全一致を確認
-    For Each k In a.Keys
-        If Not b.Exists(k) Then
+    For Each k In na.Keys
+        If Not nb.Exists(k) Then
             Exit Function
         End If
     Next k
 
     SetsEqual = True
+End Function
+
+' キー用の追加正規化：
+' ・前後の空白をトリム
+' ・末尾の「さん」「さま」「様」「さ」などの敬称/残りカスを削る
+Private Function CanonicalKeyForCompare(ByVal s As String) As String
+    s = Trim$(s)
+
+    ' ここで一度だけ「全角→半角」「大文字化」をしておくと比較が安定
+    s = StrConv(s, vbNarrow)
+    s = UCase$(s)
+
+    ' 末尾から敬称をざっくり除去
+    Do While Len(s) > 0
+        If Right$(s, 2) = "ｻﾝ" Then
+            s = Left$(s, Len(s) - 2)
+        ElseIf Right$(s, 2) = "さん" Then
+            s = Left$(s, Len(s) - 2)
+        ElseIf Right$(s, 2) = "ｻﾏ" Then
+            s = Left$(s, Len(s) - 2)
+        ElseIf Right$(s, 2) = "さま" Then
+            s = Left$(s, Len(s) - 2)
+        ElseIf Right$(s, 1) = "様" Then
+            s = Left$(s, Len(s) - 1)
+        ' ★今回の問題対策：最後に「さ」だけ残ってしまった場合も落とす
+        ElseIf Right$(s, 1) = "さ" Or Right$(s, 1) = "ｻ" Then
+            s = Left$(s, Len(s) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+
+    CanonicalKeyForCompare = Trim$(s)
 End Function
